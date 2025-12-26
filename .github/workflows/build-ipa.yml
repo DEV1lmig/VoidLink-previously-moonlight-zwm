@@ -18,29 +18,52 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          lfs: true
 
       - name: Select Xcode
         run: |
           sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
           xcodebuild -version
 
-      - name: Detect project and scheme (in moonlight-common)
+      - name: Detect valid .xcodeproj and scheme (in moonlight-common)
         id: detect
         shell: bash
         run: |
           set -euo pipefail
           cd moonlight-common
 
-          PROJECT="$(ls -1 *.xcodeproj | head -n 1)"
-          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+          echo "Searching for valid *.xcodeproj (must contain project.pbxproj)..."
 
-          SCHEME="$(xcodebuild -list -json -project "$PROJECT" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["project"]["schemes"][0])')"
+          PROJECT_DIR="$(find . -maxdepth 6 -name '*.xcodeproj' -type d -print0 \
+            | xargs -0 -I{} bash -lc 'test -f "{}/project.pbxproj" && echo "{}"' \
+            | head -n 1)"
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "No valid *.xcodeproj with project.pbxproj found under moonlight-common" >&2
+            echo "" >&2
+            echo "Debug: candidates:" >&2
+            find . -maxdepth 6 -name '*.xcodeproj' -type d -print >&2 || true
+            echo "" >&2
+            echo "Debug: showing first 200 entries under moonlight-common:" >&2
+            find . -maxdepth 4 -print | head -n 200 >&2 || true
+            exit 1
+          fi
+
+          # Normalize to a path xcodebuild likes
+          PROJECT_DIR="${PROJECT_DIR#./}"
+          echo "project=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Using project: $PROJECT_DIR"
+
+          # Get scheme list as JSON (and keep it for debugging)
+          xcodebuild -list -json -project "$PROJECT_DIR" > "$RUNNER_TEMP/xcodebuild-list.json"
+          echo "xcodebuild -list output:"
+          cat "$RUNNER_TEMP/xcodebuild-list.json"
+
+          SCHEME="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["project"]["schemes"][0])' "$RUNNER_TEMP/xcodebuild-list.json")"
           echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+          echo "Detected scheme: $SCHEME"
 
-          echo "Detected project: $PROJECT"
-          echo "Detected scheme:  $SCHEME"
-
-      - name: Archive (unsigned)
+      - name: Archive (unsigned, iPhoneOS)
         shell: bash
         run: |
           set -euo pipefail
@@ -71,12 +94,15 @@ jobs:
           APP_PATH="$(find "$ARCHIVE_PATH/Products/Applications" -maxdepth 1 -type d -name "*.app" | head -n 1)"
           if [ -z "$APP_PATH" ]; then
             echo "No .app found in archive!" >&2
+            echo "Contents of $ARCHIVE_PATH/Products/Applications:" >&2
             ls -la "$ARCHIVE_PATH/Products/Applications" || true
             exit 1
           fi
 
           OUT_DIR="$GITHUB_WORKSPACE/artifacts"
+          rm -rf "$OUT_DIR"
           mkdir -p "$OUT_DIR/Payload"
+
           cp -R "$APP_PATH" "$OUT_DIR/Payload/"
 
           IPA_NAME="$(basename "$APP_PATH" .app)-unsigned.ipa"
@@ -92,3 +118,11 @@ jobs:
           path: ${{ env.IPA_PATH }}
           if-no-files-found: error
           retention-days: 14
+
+      - name: Upload xcarchive artifact (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcarchive
+          path: ${{ env.ARCHIVE_PATH }}
+          if-no-files-found: warn
+          retention-days: 7
