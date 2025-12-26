@@ -1,0 +1,94 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ ReadmeBranch ]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+
+      - name: Detect project and scheme (in moonlight-common)
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd moonlight-common
+
+          PROJECT="$(ls -1 *.xcodeproj | head -n 1)"
+          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+
+          SCHEME="$(xcodebuild -list -json -project "$PROJECT" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["project"]["schemes"][0])')"
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+
+          echo "Detected project: $PROJECT"
+          echo "Detected scheme:  $SCHEME"
+
+      - name: Archive (unsigned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd moonlight-common
+
+          ARCHIVE_PATH="$RUNNER_TEMP/app.xcarchive"
+
+          xcodebuild archive \
+            -project "${{ steps.detect.outputs.project }}" \
+            -scheme "${{ steps.detect.outputs.scheme }}" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -archivePath "$ARCHIVE_PATH" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER=""
+
+          echo "ARCHIVE_PATH=$ARCHIVE_PATH" >> "$GITHUB_ENV"
+
+      - name: Create unsigned IPA (zip Payload)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_PATH="$(find "$ARCHIVE_PATH/Products/Applications" -maxdepth 1 -type d -name "*.app" | head -n 1)"
+          if [ -z "$APP_PATH" ]; then
+            echo "No .app found in archive!" >&2
+            ls -la "$ARCHIVE_PATH/Products/Applications" || true
+            exit 1
+          fi
+
+          OUT_DIR="$GITHUB_WORKSPACE/artifacts"
+          mkdir -p "$OUT_DIR/Payload"
+          cp -R "$APP_PATH" "$OUT_DIR/Payload/"
+
+          IPA_NAME="$(basename "$APP_PATH" .app)-unsigned.ipa"
+          (cd "$OUT_DIR" && /usr/bin/zip -r "$IPA_NAME" Payload)
+
+          echo "IPA_PATH=$OUT_DIR/$IPA_NAME" >> "$GITHUB_ENV"
+          echo "Created: $OUT_DIR/$IPA_NAME"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ipa
+          path: ${{ env.IPA_PATH }}
+          if-no-files-found: error
+          retention-days: 14
